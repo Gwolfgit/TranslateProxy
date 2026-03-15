@@ -8,10 +8,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 )
 
 func main() {
@@ -145,72 +145,118 @@ func isTextContent(ct string) bool {
 	return false
 }
 
-// readBody reads and decompresses the HTTP response body.
+// readBody reads and decompresses the HTTP response body (gzip, deflate, br).
 func readBody(resp *http.Response) ([]byte, error) {
 	if resp.Body == nil {
 		return nil, nil
 	}
 	defer resp.Body.Close()
 
-	var reader io.Reader = resp.Body
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading body: %w", err)
+	}
 
 	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
-	log.Printf("[ICAP]   Content-Encoding: %s", encoding)
+	log.Printf("[ICAP]   Content-Encoding: %q, raw size: %d bytes", encoding, len(raw))
 
 	switch encoding {
 	case "gzip":
-		gz, err := gzip.NewReader(resp.Body)
+		gz, err := gzip.NewReader(bytes.NewReader(raw))
 		if err != nil {
 			return nil, fmt.Errorf("gzip reader: %w", err)
 		}
 		defer gz.Close()
-		reader = gz
+		return io.ReadAll(gz)
 	case "deflate":
-		reader = flate.NewReader(resp.Body)
+		return io.ReadAll(flate.NewReader(bytes.NewReader(raw)))
+	case "br":
+		return decompressBrotli(raw)
 	}
 
-	return io.ReadAll(reader)
+	return raw, nil
 }
 
-// containsCyrillic checks if the string contains any Cyrillic Unicode characters.
-func containsCyrillic(s string) bool {
-	for _, r := range s {
-		if unicode.Is(unicode.Cyrillic, r) {
-			return true
-		}
+// decompressBrotli uses the brotli command-line tool for decompression.
+func decompressBrotli(data []byte) ([]byte, error) {
+	cmd := exec.Command("brotli", "-d")
+	cmd.Stdin = bytes.NewReader(data)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("brotli decompress: %w: %s", err, stderr.String())
 	}
-	return false
+	return out.Bytes(), nil
 }
 
-// cyrillicRunRegex matches sequences of Cyrillic characters including spaces/punctuation between them.
-var cyrillicRunRegex = regexp.MustCompile(`[\p{Cyrillic}][\p{Cyrillic}\s\p{P}\p{N}]*[\p{Cyrillic}]|[\p{Cyrillic}]+`)
+// cyrillicRunRegex matches runs of 2+ Cyrillic characters (with spaces/punctuation between).
+// Single Cyrillic chars are ignored — they're typically encoding artifacts, not real text.
+var cyrillicRunRegex = regexp.MustCompile(`[\p{Cyrillic}][\p{Cyrillic}\s\p{P}\p{N}]*[\p{Cyrillic}]`)
 
-// translateContentWithStats translates all Cyrillic runs and returns stats.
+// translateContentWithStats collects all Cyrillic runs, batch-translates them
+// in minimal API calls, then replaces them in the original body.
 func translateContentWithStats(body string) (string, int, error) {
-	numTranslated := 0
-	var lastErr error
-
-	result := cyrillicRunRegex.ReplaceAllStringFunc(body, func(match string) string {
-		segStart := time.Now()
-		translated, err := translateText(match)
-		segElapsed := time.Since(segStart)
-
-		if err != nil {
-			log.Printf("[TRANSLATE] FAIL (%v): %q -> error: %v", segElapsed, truncate(match, 60), err)
-			lastErr = err
-			return match
-		}
-
-		log.Printf("[TRANSLATE] OK (%v): %q -> %q", segElapsed, truncate(match, 60), truncate(translated, 60))
-		numTranslated++
-		return translated
-	})
-
-	if lastErr != nil {
-		log.Printf("[TRANSLATE] Some translations failed: %v", lastErr)
+	// Find all matches with their positions
+	matches := cyrillicRunRegex.FindAllStringIndex(string(body), -1)
+	if len(matches) == 0 {
+		return body, 0, nil
 	}
 
-	return result, numTranslated, nil
+	// Deduplicate: collect unique strings to translate, preserving order
+	type matchInfo struct {
+		start, end int
+		text       string
+	}
+	var allMatches []matchInfo
+	uniqueTexts := make(map[string]int) // text -> index in uniqueList
+	var uniqueList []string
+
+	for _, loc := range matches {
+		text := body[loc[0]:loc[1]]
+		if _, exists := uniqueTexts[text]; !exists {
+			uniqueTexts[text] = len(uniqueList)
+			uniqueList = append(uniqueList, text)
+		}
+		allMatches = append(allMatches, matchInfo{start: loc[0], end: loc[1], text: text})
+	}
+
+	log.Printf("[TRANSLATE] %d total matches, %d unique segments to translate", len(allMatches), len(uniqueList))
+
+	translateStart := time.Now()
+	translated, err := translateBatch(uniqueList)
+	translateElapsed := time.Since(translateStart)
+
+	if err != nil {
+		log.Printf("[TRANSLATE] Batch translation failed (%v): %v", translateElapsed, err)
+		return body, 0, nil
+	}
+
+	log.Printf("[TRANSLATE] Batch translation completed in %v", translateElapsed)
+
+	// Build the translation lookup
+	translationMap := make(map[string]string, len(uniqueList))
+	numTranslated := 0
+	for i, orig := range uniqueList {
+		if i < len(translated) && translated[i] != orig {
+			translationMap[orig] = translated[i]
+			numTranslated++
+		} else {
+			translationMap[orig] = orig
+		}
+	}
+
+	// Rebuild body by replacing matches back-to-front (so indices stay valid)
+	result := []byte(body)
+	for i := len(allMatches) - 1; i >= 0; i-- {
+		m := allMatches[i]
+		if replacement, ok := translationMap[m.text]; ok {
+			result = append(result[:m.start], append([]byte(replacement), result[m.end:]...)...)
+		}
+	}
+
+	return string(result), numTranslated, nil
 }
 
 func truncate(s string, max int) string {
