@@ -1,0 +1,37 @@
+services:
+  squid:
+    build:
+      context: .
+      dockerfile: Dockerfile.squid
+    container_name: translate-proxy-squid
+    ports:
+      - "3128:3128"
+    volumes:
+      - ./certs:/mnt/certs:ro
+      - squid-cache:/var/spool/squid
+      - squid-logs:/var/log/squid
+    depends_on:
+      translator:
+        condition: service_started
+    networks:
+      - proxy-net
+    restart: unless-stopped
+
+  translator:
+    build:
+      context: .
+      dockerfile: Dockerfile.translator
+    container_name: translate-proxy-translator
+    expose:
+      - "1344"
+    networks:
+      - proxy-net
+    restart: unless-stopped
+
+networks:
+  proxy-net:
+    driver: bridge
+
+volumes:
+  squid-cache:
+  squid-logs:

@@ -1,0 +1,31 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    squid-openssl \
+    openssl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create required directories
+RUN mkdir -p /var/spool/squid \
+    /var/log/squid \
+    /var/lib/squid \
+    /etc/squid/certs
+
+# Initialize the SSL certificate database
+RUN /usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB
+
+# Fix permissions
+RUN chown -R proxy:proxy /var/spool/squid /var/log/squid /var/lib/squid
+
+COPY squid/squid.conf /etc/squid/squid.conf
+
+EXPOSE 3128
+
+# Entrypoint: copy certs, fix permissions, init cache, start squid
+COPY squid/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

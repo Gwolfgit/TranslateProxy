@@ -1,0 +1,17 @@
+# Generated certificates (secrets)
+certs/
+
+# Go build artifacts
+translator/translator
+
+# Docker volumes
+squid-cache/
+squid-logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude
+.claude/
