@@ -14,8 +14,12 @@ import (
 	"time"
 )
 
+// Global translation cache (100k entries ≈ 50-100MB depending on string sizes)
+var cache = newTranslationCache(100_000)
+
 func main() {
 	log.Println("TranslateProxy ICAP translator starting on :1344")
+	log.Println("Translation cache initialized (max 100,000 entries)")
 
 	server := newICAPServer(":1344", handleTranslation)
 	log.Fatal(server.ListenAndServe())

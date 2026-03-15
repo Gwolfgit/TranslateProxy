@@ -23,48 +23,69 @@ const batchSeparator = "\n|||SEG|||\n"
 const maxQueryLen = 4500
 
 // translateBatch translates a slice of texts in as few HTTP round-trips as
-// possible by joining them with a separator, sending to Google Translate, and
-// splitting the result back. Returns a same-length slice of translated strings.
+// possible. Cached translations are returned immediately; only cache misses
+// are sent to Google Translate (batched and concurrent).
 func translateBatch(texts []string) ([]string, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
 
-	// Build batches that fit within maxQueryLen
-	type batch struct {
-		startIdx int
-		segments []string
+	results := make([]string, len(texts))
+	copy(results, texts) // fallback = originals
+
+	// Phase 1: resolve from cache
+	type uncachedEntry struct {
+		origIdx int    // index in texts/results
+		text    string
 	}
-	var batches []batch
-	cur := batch{startIdx: 0}
-	curLen := 0
+	var uncached []uncachedEntry
+	cacheHits := 0
 
 	for i, t := range texts {
-		segLen := len(t)
-		if len(cur.segments) > 0 {
+		if translated, ok := cache.Get(t); ok {
+			results[i] = translated
+			cacheHits++
+		} else {
+			uncached = append(uncached, uncachedEntry{origIdx: i, text: t})
+		}
+	}
+
+	log.Printf("[TRANSLATE] %d segments: %d cache hits, %d to translate", len(texts), cacheHits, len(uncached))
+
+	if len(uncached) == 0 {
+		cache.LogStats()
+		return results, nil
+	}
+
+	// Phase 2: batch uncached segments
+	type batch struct {
+		entries []uncachedEntry
+	}
+	var batches []batch
+	var cur batch
+	curLen := 0
+
+	for _, entry := range uncached {
+		segLen := len(entry.text)
+		if len(cur.entries) > 0 {
 			segLen += len(batchSeparator)
 		}
-		if curLen+segLen > maxQueryLen && len(cur.segments) > 0 {
+		if curLen+segLen > maxQueryLen && len(cur.entries) > 0 {
 			batches = append(batches, cur)
-			cur = batch{startIdx: i}
+			cur = batch{}
 			curLen = 0
 		}
-		cur.segments = append(cur.segments, t)
+		cur.entries = append(cur.entries, entry)
 		curLen += segLen
 	}
-	if len(cur.segments) > 0 {
+	if len(cur.entries) > 0 {
 		batches = append(batches, cur)
 	}
 
-	// Cap concurrency to avoid hammering Google and getting rate-limited
 	const maxConcurrent = 10
+	log.Printf("[TRANSLATE] %d uncached -> %d API call(s) (concurrency: %d)", len(uncached), len(batches), min(maxConcurrent, len(batches)))
 
-	log.Printf("[TRANSLATE] %d segments -> %d API call(s) (concurrency: %d)", len(texts), len(batches), min(maxConcurrent, len(batches)))
-
-	results := make([]string, len(texts))
-	// Pre-fill with originals as fallback
-	copy(results, texts)
-
+	// Phase 3: fire batches concurrently
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxConcurrent)
 
@@ -72,28 +93,34 @@ func translateBatch(texts []string) ([]string, error) {
 		wg.Add(1)
 		go func(idx int, b batch) {
 			defer wg.Done()
-			sem <- struct{}{}        // acquire
-			defer func() { <-sem }() // release
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-			joined := strings.Join(b.segments, batchSeparator)
+			segments := make([]string, len(b.entries))
+			for i, e := range b.entries {
+				segments[i] = e.text
+			}
+			joined := strings.Join(segments, batchSeparator)
 
 			translated, err := callTranslateAPI(joined)
 			if err != nil {
 				log.Printf("[TRANSLATE] Batch %d/%d FAILED: %v", idx+1, len(batches), err)
-				return // results already has originals
+				return
 			}
 
 			log.Printf("[TRANSLATE] Batch %d/%d OK", idx+1, len(batches))
 
-			// Split the translated text back into segments
 			parts := strings.Split(translated, batchSeparator)
-			if len(parts) != len(b.segments) {
-				parts = fuzzySlitBySeparator(translated, len(b.segments))
+			if len(parts) != len(b.entries) {
+				parts = fuzzySlitBySeparator(translated, len(b.entries))
 			}
 
-			for i := range b.segments {
+			for i, entry := range b.entries {
 				if i < len(parts) {
-					results[b.startIdx+i] = strings.TrimSpace(parts[i])
+					result := strings.TrimSpace(parts[i])
+					results[entry.origIdx] = result
+					// Store in cache
+					cache.Put(entry.text, result)
 				}
 			}
 		}(batchIdx, b)
@@ -101,15 +128,15 @@ func translateBatch(texts []string) ([]string, error) {
 
 	wg.Wait()
 
-	// Log translations
+	// Log summary
 	translated := 0
 	for i, orig := range texts {
 		if results[i] != orig {
 			translated++
-			log.Printf("[TRANSLATE] OK: %q -> %q", truncate(orig, 60), truncate(results[i], 60))
 		}
 	}
-	log.Printf("[TRANSLATE] %d/%d segments translated", translated, len(texts))
+	log.Printf("[TRANSLATE] %d/%d segments translated (%d from cache)", translated, len(texts), cacheHits)
+	cache.LogStats()
 
 	return results, nil
 }
