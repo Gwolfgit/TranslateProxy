@@ -24,6 +24,8 @@ services:
     container_name: translate-proxy-translator
     expose:
       - "1344"
+    volumes:
+      - translator-data:/data
     networks:
       - proxy-net
     restart: unless-stopped
@@ -35,3 +37,4 @@ networks:
 volumes:
   squid-cache:
   squid-logs:
+  translator-data:

@@ -14,12 +14,18 @@ import (
 	"time"
 )
 
-// Global translation cache (100k entries ≈ 50-100MB depending on string sizes)
-var cache = newTranslationCache(100_000)
+// Global tiered cache: 100k in-memory LRU + BoltDB on disk, 24h TTL.
+var cache *tieredCache
 
 func main() {
 	log.Println("TranslateProxy ICAP translator starting on :1344")
-	log.Println("Translation cache initialized (max 100,000 entries)")
+
+	var err error
+	cache, err = newTieredCache(100_000, "/data/translations.db", 24*time.Hour)
+	if err != nil {
+		log.Fatalf("Failed to initialize cache: %v", err)
+	}
+	defer cache.Close()
 
 	server := newICAPServer(":1344", handleTranslation)
 	log.Fatal(server.ListenAndServe())
